@@ -1356,6 +1356,13 @@ return {catalog,canPlace};})();
 const FILES=(()=>{
 const SOURCE_KINDS = new Set(["mock", "localfile", "url"]);
 const CONTAINER_KINDS = new Set(["building", "folder"]);
+const FILE_SAFETY_ERROR_CODES = Object.freeze({
+  deniedPicker: "denied-picker",
+  unsupportedFile: "unsupported-file",
+  decodeFailure: "decode-failure",
+  tooLargeFile: "too-large-file",
+  readOnlyLocalFile: "read-only-local-file",
+});
 
 function assertNonEmptyString(value, label) {
   if (typeof value !== "string" || value.trim() === "") {
@@ -1372,6 +1379,190 @@ function assertPlainObject(value, label) {
 function inferExt(name) {
   const match = /\.([^.]+)$/.exec(name);
   return match ? match[1].toLowerCase() : "";
+}
+
+function sanitizeFileLabel(name) {
+  if (typeof name !== "string") {
+    return "file";
+  }
+
+  const trimmed = name.trim();
+  if (!trimmed) {
+    return "file";
+  }
+
+  const pieces = trimmed.replaceAll("\\", "/").split("/").filter(Boolean);
+  return pieces.at(-1) || "file";
+}
+
+function formatByteCount(value) {
+  if (!Number.isFinite(value) || value < 0) {
+    return "0 B";
+  }
+
+  if (value < 1024) {
+    return `${Math.round(value)} B`;
+  }
+
+  if (value < 1024 * 1024) {
+    const kilobytes = value / 1024;
+    return `${kilobytes >= 10 ? kilobytes.toFixed(0) : kilobytes.toFixed(1)} KB`;
+  }
+
+  const megabytes = value / (1024 * 1024);
+  return `${megabytes >= 10 ? megabytes.toFixed(0) : megabytes.toFixed(1)} MB`;
+}
+
+function normalizeAcceptedExtensions(accept) {
+  if (accept === undefined) {
+    return [];
+  }
+
+  if (!Array.isArray(accept)) {
+    throw new TypeError("accept must be an array when provided.");
+  }
+
+  return [...new Set(
+    accept
+      .filter((entry) => typeof entry === "string")
+      .map((entry) => entry.trim().toLowerCase())
+      .filter((entry) => entry.startsWith(".")),
+  )];
+}
+
+class FileSafetyError extends Error {
+  constructor({ code, message, userMessage, fileName = null, cause } = {}) {
+    assertNonEmptyString(code, "error.code");
+    assertNonEmptyString(message, "error.message");
+    assertNonEmptyString(userMessage, "error.userMessage");
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "FileSafetyError";
+    this.code = code;
+    this.userMessage = userMessage;
+
+    if (fileName) {
+      this.fileName = sanitizeFileLabel(fileName);
+    }
+  }
+}
+
+function isFileSafetyError(error, code) {
+  const matchesType = error instanceof FileSafetyError;
+
+  if (!matchesType) {
+    return false;
+  }
+
+  if (code === undefined) {
+    return true;
+  }
+
+  assertNonEmptyString(code, "code");
+  return error.code === code;
+}
+
+function getFileSafetyMessage(error) {
+  return isFileSafetyError(error)
+    ? error.userMessage
+    : "The file could not be opened safely.";
+}
+
+function createDeniedPickerError() {
+  return new FileSafetyError({
+    code: FILE_SAFETY_ERROR_CODES.deniedPicker,
+    message: "Local file selection was cancelled or denied.",
+    userMessage: "File selection was cancelled or denied. Choose a file to continue.",
+  });
+}
+
+function createUnsupportedFileError({ name, accept = [] } = {}) {
+  const fileName = sanitizeFileLabel(name);
+  const acceptedExtensions = normalizeAcceptedExtensions(accept);
+  const suffix =
+    acceptedExtensions.length > 0
+      ? ` Allowed types: ${acceptedExtensions.join(", ")}.`
+      : "";
+
+  return new FileSafetyError({
+    code: FILE_SAFETY_ERROR_CODES.unsupportedFile,
+    message: `Unsupported file type for '${fileName}'.${suffix}`.trim(),
+    userMessage: `Unsupported file type for '${fileName}'.${suffix}`.trim(),
+    fileName,
+  });
+}
+
+function createDecodeFailureError({ name, cause } = {}) {
+  const fileName = sanitizeFileLabel(name);
+
+  return new FileSafetyError({
+    code: FILE_SAFETY_ERROR_CODES.decodeFailure,
+    message: `Could not decode '${fileName}'.`,
+    userMessage: `Could not read '${fileName}'. Try a text file or attach a smaller document.`,
+    fileName,
+    cause,
+  });
+}
+
+function createTooLargeFileError({ name, sizeBytes, limitBytes } = {}) {
+  const fileName = sanitizeFileLabel(name);
+  const sizeLabel = formatByteCount(sizeBytes);
+  const limitLabel = formatByteCount(limitBytes);
+
+  return new FileSafetyError({
+    code: FILE_SAFETY_ERROR_CODES.tooLargeFile,
+    message: `'${fileName}' is too large (${sizeLabel} > ${limitLabel}).`,
+    userMessage: `'${fileName}' is too large to attach (${sizeLabel}). Limit: ${limitLabel}.`,
+    fileName,
+  });
+}
+
+function createReadOnlyLocalFileError({ name } = {}) {
+  const fileName = sanitizeFileLabel(name);
+
+  return new FileSafetyError({
+    code: FILE_SAFETY_ERROR_CODES.readOnlyLocalFile,
+    message: `Local file '${fileName}' is read-only in this phase.`,
+    userMessage: `Local files are read-only in this phase. '${fileName}' can be viewed or downloaded, but not changed here.`,
+    fileName,
+  });
+}
+
+function validateLocalFileSelection({
+  name,
+  accept = [],
+  sizeBytes,
+  maxBytes,
+} = {}) {
+  assertNonEmptyString(name, "file.name");
+  const fileName = sanitizeFileLabel(name);
+  const acceptedExtensions = normalizeAcceptedExtensions(accept);
+  const ext = inferExt(fileName);
+
+  if (acceptedExtensions.length > 0 && !acceptedExtensions.includes(`.${ext}`)) {
+    throw createUnsupportedFileError({
+      name: fileName,
+      accept: acceptedExtensions,
+    });
+  }
+
+  if (
+    Number.isFinite(maxBytes) &&
+    maxBytes >= 0 &&
+    Number.isFinite(sizeBytes) &&
+    sizeBytes > maxBytes
+  ) {
+    throw createTooLargeFileError({
+      name: fileName,
+      sizeBytes,
+      limitBytes: maxBytes,
+    });
+  }
+
+  return {
+    name: fileName,
+    ext,
+    sizeBytes: Number.isFinite(sizeBytes) ? sizeBytes : null,
+  };
 }
 
 function cloneFileRef(file) {
@@ -1428,6 +1619,14 @@ function encodeText(text) {
   return new TextEncoder().encode(text);
 }
 
+function cloneBytes(bytes) {
+  return new Uint8Array(bytes);
+}
+
+function buildLocalFileAddr(fileId, name) {
+  return `localfile://${fileId}/${encodeURIComponent(name)}`;
+}
+
 function assertNodeRecordLike(node) {
   assertPlainObject(node, "node");
   assertNonEmptyString(node.id, "node.id");
@@ -1435,6 +1634,103 @@ function assertNodeRecordLike(node) {
   if (node.links !== undefined && !Array.isArray(node.links)) {
     throw new TypeError("node.links must be an array when provided.");
   }
+}
+
+function createMutableTextSource({ name, text = "" } = {}) {
+  assertNonEmptyString(name, "source.name");
+  let currentText = typeof text === "string" ? text : String(text ?? "");
+
+  return {
+    name,
+    async readText() {
+      return currentText;
+    },
+    async readBytes() {
+      return encodeText(currentText);
+    },
+    async writeText(nextText) {
+      currentText = String(nextText ?? "");
+    },
+  };
+}
+
+async function readTextFromFileLike(file, name) {
+  if (!file || typeof file.text !== "function") {
+    throw new TypeError("source file must expose text().");
+  }
+
+  try {
+    const text = await file.text();
+    return typeof text === "string" ? text : String(text ?? "");
+  } catch (error) {
+    throw createDecodeFailureError({ name, cause: error });
+  }
+}
+
+async function readBytesFromFileLike(file, name) {
+  if (file && typeof file.arrayBuffer === "function") {
+    try {
+      const buffer = await file.arrayBuffer();
+      return new Uint8Array(buffer);
+    } catch (error) {
+      throw createDecodeFailureError({ name, cause: error });
+    }
+  }
+
+  return encodeText(await readTextFromFileLike(file, name));
+}
+
+function normalizeLocalSource(source, fallbackName) {
+  if (source && typeof source.getFile === "function") {
+    return createFileSystemHandleSource(source, fallbackName);
+  }
+
+  if (source && typeof source.text === "function") {
+    return createInputFileSource(source, fallbackName);
+  }
+
+  assertPlainObject(source, "source");
+
+  const rawName =
+    (typeof source.name === "string" && source.name.trim()) ||
+    (typeof fallbackName === "string" && fallbackName.trim());
+
+  if (!rawName) {
+    throw new TypeError("source.name must be a non-empty string.");
+  }
+
+  if (typeof source.readText !== "function") {
+    throw new TypeError("source.readText must be a function.");
+  }
+
+  const { name } = validateLocalFileSelection({
+    name: rawName,
+    sizeBytes: source.sizeBytes,
+  });
+
+  return {
+    name,
+    sizeBytes: Number.isFinite(source.sizeBytes) ? source.sizeBytes : null,
+    async readText() {
+      try {
+        const text = await source.readText();
+        return typeof text === "string" ? text : String(text ?? "");
+      } catch (error) {
+        throw createDecodeFailureError({ name, cause: error });
+      }
+    },
+    async readBytes() {
+      if (typeof source.readBytes === "function") {
+        try {
+          return cloneBytes(await source.readBytes());
+        } catch (error) {
+          throw createDecodeFailureError({ name, cause: error });
+        }
+      }
+
+      return encodeText(await this.readText());
+    },
+  };
 }
 
 function appendNodeLink(node, target) {
@@ -1535,6 +1831,62 @@ function linkNodeToFile(node, file) {
 function linkNodeToUrl(node, url) {
   assertHttpUrl(url);
   return appendNodeLink(node, url);
+}
+
+function createFileSystemHandleSource(handle, fallbackName) {
+  if (!handle || typeof handle.getFile !== "function") {
+    throw new TypeError("handle must expose getFile().");
+  }
+
+  const rawName =
+    (typeof handle.name === "string" && handle.name.trim()) ||
+    (typeof fallbackName === "string" && fallbackName.trim());
+
+  if (!rawName) {
+    throw new TypeError("handle.name must be a non-empty string.");
+  }
+
+  const { name } = validateLocalFileSelection({ name: rawName });
+
+  return {
+    name,
+    async readText() {
+      return readTextFromFileLike(await handle.getFile(), name);
+    },
+    async readBytes() {
+      return readBytesFromFileLike(await handle.getFile(), name);
+    },
+  };
+}
+
+function createInputFileSource(file, fallbackName) {
+  if (!file || typeof file.text !== "function") {
+    throw new TypeError("file must expose text().");
+  }
+
+  const rawName =
+    (typeof file.name === "string" && file.name.trim()) ||
+    (typeof fallbackName === "string" && fallbackName.trim());
+
+  if (!rawName) {
+    throw new TypeError("file.name must be a non-empty string.");
+  }
+
+  const { name } = validateLocalFileSelection({
+    name: rawName,
+    sizeBytes: file.size,
+  });
+
+  return {
+    name,
+    sizeBytes: Number.isFinite(file.size) ? file.size : null,
+    async readText() {
+      return readTextFromFileLike(file, name);
+    },
+    async readBytes() {
+      return readBytesFromFileLike(file, name);
+    },
+  };
 }
 
 function createFileWorkspace({ containers = [], provider } = {}) {
@@ -1735,7 +2087,160 @@ class MockFileProvider {
   }
 }
 
-return {createFileRef,createContainerRef,openContainer,openDocument,linkNodeToFile,linkNodeToUrl,createFileWorkspace,MockFileProvider};})();
+class RealFileProvider {
+  constructor({ containers = [], documents = {}, localFiles = [] } = {}) {
+    this.containers = new Map();
+    this.sources = new Map();
+    this.nextFileId = 1;
+
+    for (const container of containers) {
+      const normalized = createContainerRef(container);
+
+      if (this.containers.has(normalized.id)) {
+        throw new Error(`Duplicate container id: ${normalized.id}`);
+      }
+
+      this.containers.set(normalized.id, normalized);
+
+      for (const file of normalized.files) {
+        if (this.sources.has(file.id)) {
+          throw new Error(`Duplicate file id: ${file.id}`);
+        }
+
+        const initialText = typeof documents[file.id] === "string" ? documents[file.id] : "";
+        this.sources.set(
+          file.id,
+          createMutableTextSource({
+            name: file.name,
+            text: initialText,
+          }),
+        );
+        this.nextFileId += 1;
+      }
+    }
+
+    for (const entry of localFiles) {
+      this.attachLocalFile(entry.containerId, entry.source, entry);
+    }
+  }
+
+  requireContainer(containerId) {
+    const container = this.containers.get(containerId);
+
+    if (!container) {
+      throw new Error(`Unknown container: ${containerId}`);
+    }
+
+    return container;
+  }
+
+  findFile(fileId) {
+    for (const container of this.containers.values()) {
+      const file = container.files.find((entry) => entry.id === fileId);
+
+      if (file) {
+        return file;
+      }
+    }
+
+    throw new Error(`Unknown file: ${fileId}`);
+  }
+
+  requireSource(fileId) {
+    const source = this.sources.get(fileId);
+
+    if (!source) {
+      throw new Error(`Unknown file source: ${fileId}`);
+    }
+
+    return source;
+  }
+
+  appendFile(containerId, file, source) {
+    const container = this.requireContainer(containerId);
+    const updatedContainer = replaceContainerFiles(container, [...container.files, file]);
+
+    this.containers.set(containerId, updatedContainer);
+    this.sources.set(file.id, source);
+  }
+
+  createLocalFileRef({ fileId, name }) {
+    return createFileRef({
+      id: fileId,
+      name,
+      ext: inferExt(name) || "txt",
+      sourceKind: "localfile",
+      addr: buildLocalFileAddr(fileId, name),
+    });
+  }
+
+  attachLocalFile(containerId, source, options = {}) {
+    const normalizedSource = normalizeLocalSource(source, options.name);
+    validateLocalFileSelection({
+      name: normalizedSource.name,
+      accept: options.accept,
+      sizeBytes: normalizedSource.sizeBytes,
+      maxBytes: options.maxBytes,
+    });
+    const fileId = options.fileId || `file_local_${this.nextFileId}`;
+    this.nextFileId += 1;
+
+    const file = this.createLocalFileRef({
+      fileId,
+      name: normalizedSource.name,
+    });
+
+    this.appendFile(containerId, file, normalizedSource);
+    return cloneFileRef(file);
+  }
+
+  async list(containerId) {
+    const container = this.requireContainer(containerId);
+    return container.files.map(cloneFileRef);
+  }
+
+  async read(fileId) {
+    const source = this.requireSource(fileId);
+    return { text: await source.readText() };
+  }
+
+  async write(fileId, text) {
+    void text;
+    this.requireSource(fileId);
+    const file = this.findFile(fileId);
+    throw createReadOnlyLocalFileError({ name: file.name });
+  }
+
+  async download(fileId) {
+    const file = this.findFile(fileId);
+    const source = this.requireSource(fileId);
+    const bytes =
+      typeof source.readBytes === "function"
+        ? await source.readBytes()
+        : encodeText(await source.readText());
+
+    return {
+      name: file.name,
+      bytes: cloneBytes(bytes),
+    };
+  }
+
+  async attach(containerId, file) {
+    assertPlainObject(file, "file");
+    assertNonEmptyString(file.name, "file.name");
+
+    const source = createMutableTextSource({
+      name: file.name,
+      text: typeof file.text === "string" ? file.text : String(file.text ?? ""),
+    });
+
+    return this.attachLocalFile(containerId, source, {
+      name: file.name,
+    });
+  }
+}
+
+return {createFileRef,createContainerRef,openContainer,openDocument,linkNodeToFile,linkNodeToUrl,createFileWorkspace,createFileSystemHandleSource,createInputFileSource,MockFileProvider,RealFileProvider};})();
 const PACING=(()=>{
 function assertBuildingId(buildingId) {
   if (typeof buildingId !== "string" || buildingId.trim() === "") {
@@ -2964,6 +3469,7 @@ const openContainer=FILES.openContainer;const {draftLinkedDocument,linkFile,mock
 
 
 
+
 const TUTORIAL_STEPS = Object.freeze([
   "move",
   "openFolder",
@@ -2974,6 +3480,97 @@ const TUTORIAL_STEPS = Object.freeze([
   "setBoundary",
   "buildNext",
 ]);
+
+const STEP_COPY = Object.freeze({
+  move: Object.freeze({
+    label: "Walk the Hearth loop",
+    prompt: "Walk, enter the Hearth, then return outside.",
+    success: "Movement, entry, and exit all count toward the tutorial.",
+    retry: "Nothing resets here. Walk again, step inside, and come back out when ready.",
+    recovery: Object.freeze([
+      "Wander back to the Hearth if you get turned around.",
+      "Press Enter near the Hearth door to step inside.",
+      "Press Esc to leave the interior and finish the loop.",
+    ]),
+  }),
+  openFolder: Object.freeze({
+    label: "Open a folder",
+    prompt: "Open one building or furniture inventory.",
+    success: "Any inventory with files counts, including the Hearth.",
+    retry: "If nothing opens, move closer to a folder object and try the interact action again.",
+    recovery: Object.freeze([
+      "Return to the Hearth to use the safest starter inventory.",
+      "Stand next to a container furniture piece before interacting.",
+      "You can reopen the same folder as many times as you need.",
+    ]),
+  }),
+  linkFile: Object.freeze({
+    label: "Link one file",
+    prompt: "Link a file to the current node.",
+    success: "The tutorial only needs one valid file link.",
+    retry: "Pick the same file again if the first attempt did not stick; no progress is lost.",
+    recovery: Object.freeze([
+      "Open the node sheet and choose the file-link action again.",
+      "Use any existing Hearth file if you do not want to attach a new one.",
+      "The tutorial advances as soon as one linked file is visible on the node.",
+    ]),
+  }),
+  viewFile: Object.freeze({
+    label: "Read the linked document",
+    prompt: "Open the linked file as a document.",
+    success: "A successful open is enough; you do not need to read the whole file.",
+    retry: "If the document view closes or fails, reopen the same linked file from the node sheet.",
+    recovery: Object.freeze([
+      "Return to the node sheet and select the linked file again.",
+      "Use the same file you just linked; no new file is required.",
+      "Only a visible document read is needed for this step.",
+    ]),
+  }),
+  editFile: Object.freeze({
+    label: "Make one edit",
+    prompt: "Edit the open document and persist the change.",
+    success: "Any small saved change counts.",
+    retry: "If the write does not count yet, make one more tiny edit and save again.",
+    recovery: Object.freeze([
+      "Change a single word or line; large edits are unnecessary.",
+      "Reopen the same document if you want a clean place to try again.",
+      "The Hearth keeps the tutorial moving even if you repeat the same file.",
+    ]),
+  }),
+  enchant: Object.freeze({
+    label: "Wake the Hearth",
+    prompt: "Assign a power so the building wakes up.",
+    success: "Any non-quiet power state completes the step.",
+    retry: "Choose a power again if the building still looks quiet; the tutorial only needs one wake-up.",
+    recovery: Object.freeze([
+      "Open the node sheet and pick one power category.",
+      "Use any valid power option; this is a safe mock choice.",
+      "The building mood changing away from quiet is the success signal.",
+    ]),
+  }),
+  setBoundary: Object.freeze({
+    label: "Set one boundary",
+    prompt: "Add a don't-touch boundary and confirm it denies access.",
+    success: "A denial is the correct outcome here.",
+    retry: "If access is still allowed, add the boundary again. The tutorial expects one safe refusal.",
+    recovery: Object.freeze([
+      "Use the current Hearth node as the blocked target.",
+      "A denied action is success, not failure.",
+      "You can retry without losing any earlier tutorial progress.",
+    ]),
+  }),
+  buildNext: Object.freeze({
+    label: "Place one new building",
+    prompt: "Place exactly one new building, then let the pacing gate stop the second.",
+    success: "The first new building should place, and the gate should stop the next extra one.",
+    retry: "If the gate stops you, that can be the intended outcome. The tutorial is teaching the limit, not punishing you.",
+    recovery: Object.freeze([
+      "Place only one new building beyond the starter set.",
+      "If the next placement is blocked, the pacing gate is working as designed.",
+      "You can always come back to the Hearth and continue from this checkpoint.",
+    ]),
+  }),
+});
 
 function assertPlainObject(value, label) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -3029,6 +3626,33 @@ function nextStep(done) {
   }
 
   return TUTORIAL_STEPS[TUTORIAL_STEPS.length - 1];
+}
+
+function stepIndex(step) {
+  return TUTORIAL_STEPS.indexOf(step);
+}
+
+function cloneStepStatus(entry) {
+  return {
+    step: entry.step,
+    label: entry.label,
+    status: entry.status,
+  };
+}
+
+function cloneObservationItem(entry) {
+  return {
+    label: entry.label,
+    done: entry.done,
+  };
+}
+
+function buildMoveObservation(observation = {}) {
+  return [
+    { label: "Walk a few tiles", done: Boolean(observation.moved) },
+    { label: "Step inside the Hearth", done: Boolean(observation.enteredInterior) },
+    { label: "Return outside", done: Boolean(observation.returnedToVillage) },
+  ].map(cloneObservationItem);
 }
 
 function normalizeTutorialState(state = {}) {
@@ -3298,6 +3922,76 @@ function runBackpackDrill({
   };
 }
 
+function buildTutorialOverlayView({
+  tutorialState = createTutorialState(),
+  movementObservation = {},
+  lastSignal = null,
+  recoveryState = createTutorialRecoveryState(),
+} = {}) {
+  const tutorial = normalizeTutorialState(tutorialState);
+  const copy = STEP_COPY[tutorial.step];
+  const completed = tutorial.done.length;
+  const total = TUTORIAL_STEPS.length;
+  const complete = isTutorialComplete(tutorial);
+  const stepStatuses = TUTORIAL_STEPS.map((step) => {
+    const status = tutorial.done.includes(step)
+      ? "done"
+      : step === tutorial.step
+        ? "active"
+        : "upcoming";
+
+    return cloneStepStatus({
+      step,
+      label: STEP_COPY[step].label,
+      status,
+    });
+  });
+
+  let tone = "active";
+  let detail = copy.success;
+
+  if (complete) {
+    tone = "complete";
+    detail = "The Hearth is ready. You can revisit any step without losing progress.";
+  } else if (
+    lastSignal &&
+    typeof lastSignal === "object" &&
+    lastSignal.step === tutorial.step &&
+    lastSignal.ok === false
+  ) {
+    tone = "retry";
+    detail = copy.retry;
+  }
+
+  return {
+    complete,
+    currentStep: tutorial.step,
+    title: copy.label,
+    prompt: copy.prompt,
+    progress: {
+      completed,
+      total,
+      label: `${completed}/${total}`,
+      currentIndex: Math.max(0, stepIndex(tutorial.step)) + 1,
+    },
+    steps: stepStatuses,
+    status: {
+      tone,
+      title: complete ? "Tutorial complete" : `Step ${Math.max(0, stepIndex(tutorial.step)) + 1}: ${copy.label}`,
+      detail,
+      observation:
+        tutorial.step === "move" ? buildMoveObservation(movementObservation) : [],
+    },
+    recovery: {
+      visible: complete !== true,
+      ...buildTutorialRecoveryView({
+        tutorialState: tutorial,
+        recoveryState,
+      }),
+    },
+  };
+}
+
 
 
 const DEFAULT_PERMISSIONS = Object.freeze([
@@ -3425,9 +4119,1352 @@ function renderControlRoom(input = {}) {
   };
 }
 
-return {TUTORIAL_STEPS,createTutorialState,isTutorialComplete,advance,runMoveStep,runOpenFolderStep,runLinkFileStep,runViewFileStep,runEditFileStep,runEnchantStep,runSetBoundaryStep,runBuildNextStep,runBackpackDrill,createMockAgentPermission,createHearthControlRoom,renderControlRoom};})();
+
+
+const GOLDEN_MORNING_HOUR = 8;
+const GOLDEN_MORNING_TONE = "golden-morning";
+const COLD_OPEN_FICTION =
+  "The Hearth wakes before the village, asking you to set one real thing in order.";
+
+const STEP_TASKS = Object.freeze({
+  move: "Walk through the village, step inside the Hearth, then return outside.",
+  openFolder: "Open one building or furniture inventory so the Hearth can show you its files.",
+  linkFile: "Link one file to the Hearth so this place starts reflecting real life.",
+  viewFile: "Open the linked file and read its document text in the room.",
+  editFile: "Edit the document once so the Hearth proves it can hold a real change.",
+  enchant: "Choose a power for the Hearth so the building wakes up.",
+  setBoundary: "Mark one thing as don't-touch and confirm the boundary refuses it.",
+  buildNext: "Place exactly one new building, then let the pacing gate stop the second.",
+});
+
+const STEP_PROMPTS = Object.freeze({
+  move: Object.freeze([
+    Object.freeze({ control: "W/A/S/D", label: "Walk around." }),
+    Object.freeze({ control: "Enter", label: "Step inside the Hearth." }),
+    Object.freeze({ control: "Esc", label: "Return outside to finish the loop." }),
+  ]),
+  openFolder: Object.freeze([
+    Object.freeze({ control: "E", label: "Inspect the nearest folder or building." }),
+  ]),
+  linkFile: Object.freeze([
+    Object.freeze({ control: "Node sheet", label: "Choose Link and attach one file." }),
+  ]),
+  viewFile: Object.freeze([
+    Object.freeze({ control: "Node sheet", label: "Open the linked document." }),
+  ]),
+  editFile: Object.freeze([
+    Object.freeze({ control: "Document view", label: "Make one small edit and save it." }),
+  ]),
+  enchant: Object.freeze([
+    Object.freeze({ control: "Node sheet", label: "Set a power and wake the building." }),
+  ]),
+  setBoundary: Object.freeze([
+    Object.freeze({ control: "Mock gate", label: "Add a don't-touch rule and verify denial." }),
+  ]),
+  buildNext: Object.freeze([
+    Object.freeze({ control: "Build mode", label: "Place one new building only." }),
+  ]),
+});
+
+function assertPlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+}
+
+function assertBoolean(value, label) {
+  if (typeof value !== "boolean") {
+    throw new TypeError(`${label} must be a boolean.`);
+  }
+}
+
+function assertStep(step, label = "step") {
+  if (typeof step !== "string" || !TUTORIAL_STEPS.includes(step)) {
+    throw new RangeError(`${label} must be one of: ${TUTORIAL_STEPS.join(", ")}.`);
+  }
+}
+
+function normalizeName(name, { allowBlank = false } = {}) {
+  if (typeof name !== "string") {
+    throw new TypeError("playerName must be a string.");
+  }
+
+  const trimmed = name.trim();
+  if (!allowBlank && trimmed === "") {
+    throw new TypeError("playerName must be a non-empty string.");
+  }
+
+  return trimmed;
+}
+
+function clonePrompt(prompt) {
+  return {
+    control: prompt.control,
+    label: prompt.label,
+  };
+}
+
+function clonePrompts(prompts) {
+  return prompts.map(clonePrompt);
+}
+
+function normalizeColdOpenState(input = {}) {
+  assertPlainObject(input, "state");
+
+  const playerName = normalizeName(input.playerName ?? "", { allowBlank: true });
+  const fictionDismissed = input.fictionDismissed ?? false;
+  const taskAcknowledged = input.taskAcknowledged ?? false;
+
+  assertBoolean(fictionDismissed, "state.fictionDismissed");
+  assertBoolean(taskAcknowledged, "state.taskAcknowledged");
+
+  return {
+    playerName,
+    fictionDismissed,
+    taskAcknowledged,
+  };
+}
+
+function resolveStep(tutorialState) {
+  const normalized = createTutorialState(tutorialState);
+  assertStep(normalized.step, "tutorialState.step");
+  return normalized.step;
+}
+
+function resolvePrompts(playerName, step) {
+  if (!playerName) {
+    return [Object.freeze({ control: "Type", label: "Name your Ghost to begin." })];
+  }
+
+  return clonePrompts(STEP_PROMPTS[step] ?? []);
+}
+
+function createColdOpenState(input = {}) {
+  return normalizeColdOpenState(input);
+}
+
+function setPlayerName(state, playerName) {
+  const current = normalizeColdOpenState(state);
+
+  return {
+    ...current,
+    playerName: normalizeName(playerName),
+  };
+}
+
+function dismissFiction(state) {
+  const current = normalizeColdOpenState(state);
+  return {
+    ...current,
+    fictionDismissed: true,
+  };
+}
+
+function acknowledgeFirstTask(state) {
+  const current = normalizeColdOpenState(state);
+  return {
+    ...current,
+    taskAcknowledged: true,
+  };
+}
+
+function buildColdOpenView({
+  coldOpenState = createColdOpenState(),
+  tutorialState = createTutorialState(),
+  currentHour = GOLDEN_MORNING_HOUR,
+} = {}) {
+  const state = normalizeColdOpenState(coldOpenState);
+  const tutorial = createTutorialState(tutorialState);
+  const step = resolveStep(tutorial);
+  const complete = isTutorialComplete(tutorial);
+  const forcedGoldenMorning = complete !== true;
+
+  if (!Number.isInteger(currentHour) || currentHour < 0 || currentHour > 23) {
+    throw new RangeError("currentHour must be an integer between 0 and 23.");
+  }
+
+  return {
+    active: forcedGoldenMorning,
+    playerName: state.playerName,
+    namePrompt: {
+      visible: state.playerName === "",
+      title: "Name your Ghost",
+      placeholder: "Ghost name",
+      confirmLabel: "Start the morning",
+    },
+    fiction: {
+      visible: state.playerName !== "" && state.fictionDismissed !== true,
+      text: COLD_OPEN_FICTION,
+    },
+    firstTask: {
+      visible: state.playerName !== "",
+      title: "First Task",
+      step,
+      prompt: STEP_TASKS[step],
+      progressLabel: `${tutorial.done.length}/${TUTORIAL_STEPS.length}`,
+      stepIndex: TUTORIAL_STEPS.indexOf(step) + 1,
+      totalSteps: TUTORIAL_STEPS.length,
+      acknowledged: state.taskAcknowledged,
+      recoveryHint:
+        "This tutorial never fails. Return to the Hearth and keep going whenever you are ready.",
+    },
+    contextualPrompts: resolvePrompts(state.playerName, step),
+    sessionTone: {
+      name: GOLDEN_MORNING_TONE,
+      forced: forcedGoldenMorning,
+      displayHour: forcedGoldenMorning ? GOLDEN_MORNING_HOUR : currentHour,
+      actualHour: currentHour,
+    },
+  };
+}
+
+return {TUTORIAL_STEPS,createTutorialState,isTutorialComplete,advance,runMoveStep,runOpenFolderStep,runLinkFileStep,runViewFileStep,runEditFileStep,runEnchantStep,runSetBoundaryStep,runBuildNextStep,runBackpackDrill,createMockAgentPermission,createHearthControlRoom,renderControlRoom,createColdOpenState,setPlayerName,dismissFiction,acknowledgeFirstTask,buildColdOpenView,GOLDEN_MORNING_HOUR,GOLDEN_MORNING_TONE,COLD_OPEN_FICTION};})();
+const NODESHEET_UI=(()=>{
+const FIELD_SECTIONS = Object.freeze([
+  "name",
+  "notes",
+  "links",
+  "files",
+  "power",
+  "ai",
+  "actions",
+  "tier",
+]);
+
+const ACTION_TARGETS = Object.freeze([
+  "action:open",
+  "action:attach",
+  "action:download",
+  "action:markDone",
+]);
+
+const FOCUS_ORDER = Object.freeze([
+  "name",
+  "notes",
+  "links",
+  "files",
+  "power",
+  "ai",
+  ...ACTION_TARGETS,
+  "tier",
+]);
+
+const POWER_CATEGORIES = new Set(["email", "calendar", "notes", "files", "web-feed", "tasks"]);
+const TIERS = new Set(["read", "do"]);
+const SOURCE_KINDS = new Set(["mock", "localfile", "url"]);
+
+function assertPlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+}
+
+function cloneIssue(issue) {
+  return {
+    field: issue.field,
+    message: issue.message,
+  };
+}
+
+function cloneValidation(validation) {
+  return {
+    errors: validation.errors.map(cloneIssue),
+    warnings: validation.warnings.map(cloneIssue),
+    isValid: Boolean(validation.isValid),
+  };
+}
+
+function normalizeFocusTarget(target) {
+  return FOCUS_ORDER.includes(target) ? target : FOCUS_ORDER[0];
+}
+
+function getFocusSection(target) {
+  if (ACTION_TARGETS.includes(target)) {
+    return "actions";
+  }
+
+  return FIELD_SECTIONS.includes(target) ? target : FIELD_SECTIONS[0];
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isNonEmptyString(value) {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+function isValidHttpUrl(value) {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeUrl(value) {
+  return /^(?:https?:\/\/|www\.)/i.test(value) || value.includes("://");
+}
+
+function pushIssue(issues, field, message) {
+  issues.push({ field, message });
+}
+
+function createFocusState(options = {}) {
+  assertPlainObject(options, "options");
+
+  return {
+    focusedField: normalizeFocusTarget(options.focusedField),
+    validation: {
+      errors: [],
+      warnings: [],
+      isValid: true,
+    },
+  };
+}
+
+function focusField(state, field) {
+  assertPlainObject(state, "state");
+
+  return {
+    focusedField: normalizeFocusTarget(field),
+    validation: cloneValidation(state.validation ?? { errors: [], warnings: [], isValid: true }),
+  };
+}
+
+function focusNextField(state) {
+  assertPlainObject(state, "state");
+
+  const currentIndex = FOCUS_ORDER.indexOf(normalizeFocusTarget(state.focusedField));
+  const nextIndex = (currentIndex + 1) % FOCUS_ORDER.length;
+  return focusField(state, FOCUS_ORDER[nextIndex]);
+}
+
+function focusPreviousField(state) {
+  assertPlainObject(state, "state");
+
+  const currentIndex = FOCUS_ORDER.indexOf(normalizeFocusTarget(state.focusedField));
+  const previousIndex = (currentIndex - 1 + FOCUS_ORDER.length) % FOCUS_ORDER.length;
+  return focusField(state, FOCUS_ORDER[previousIndex]);
+}
+
+function validateNodeRecord(node) {
+  assertPlainObject(node, "node");
+
+  const errors = [];
+  const warnings = [];
+
+  if (!isNonEmptyString(node.name)) {
+    pushIssue(errors, "name", "Name is required before the node sheet can be considered valid.");
+  }
+
+  if (!Array.isArray(node.links)) {
+    pushIssue(errors, "links", "Links must be an array of node ids or absolute http(s) URLs.");
+  } else {
+    const seenLinks = new Set();
+
+    node.links.forEach((link, index) => {
+      if (!isPlainObject(link) || !isNonEmptyString(link.to)) {
+        pushIssue(errors, "links", `Link ${index + 1} must target a node id or URL.`);
+        return;
+      }
+
+      const target = link.to.trim();
+      if (looksLikeUrl(target) && !isValidHttpUrl(target)) {
+        pushIssue(errors, "links", `Link ${index + 1} must use a valid absolute http(s) URL.`);
+        return;
+      }
+
+      if (seenLinks.has(target)) {
+        pushIssue(warnings, "links", `Duplicate link target: ${target}`);
+      }
+      seenLinks.add(target);
+    });
+  }
+
+  if (!Array.isArray(node.files)) {
+    pushIssue(errors, "files", "Files must be an array of FileRef records.");
+  } else {
+    const seenFileIds = new Set();
+
+    node.files.forEach((file, index) => {
+      if (!isPlainObject(file)) {
+        pushIssue(errors, "files", `File ${index + 1} must be a FileRef object.`);
+        return;
+      }
+
+      if (!isNonEmptyString(file.id)) {
+        pushIssue(errors, "files", `File ${index + 1} must include a stable id.`);
+      } else if (seenFileIds.has(file.id.trim())) {
+        pushIssue(errors, "files", `Duplicate attached file id: ${file.id.trim()}`);
+      } else {
+        seenFileIds.add(file.id.trim());
+      }
+
+      if (!isNonEmptyString(file.name)) {
+        pushIssue(errors, "files", `File ${index + 1} must include a display name.`);
+      }
+
+      if (!isNonEmptyString(file.ext)) {
+        pushIssue(errors, "files", `File ${index + 1} must include a file extension.`);
+      }
+
+      if (!SOURCE_KINDS.has(file.sourceKind)) {
+        pushIssue(
+          errors,
+          "files",
+          `File ${index + 1} must use sourceKind mock, localfile, or url.`,
+        );
+      }
+
+      if (!isNonEmptyString(file.addr)) {
+        pushIssue(errors, "files", `File ${index + 1} must include an address.`);
+      }
+    });
+  }
+
+  if (node.power != null) {
+    if (!isPlainObject(node.power)) {
+      pushIssue(errors, "power", "Power must be null or a PowerBinding object.");
+    } else {
+      if (!POWER_CATEGORIES.has(node.power.category)) {
+        pushIssue(errors, "power", "Power category must use one of the frozen categories.");
+      }
+
+      if (!isPlainObject(node.power.scope ?? {})) {
+        pushIssue(errors, "power", "Power scope must be a plain object.");
+      }
+    }
+  }
+
+  if (!TIERS.has(node.tier)) {
+    pushIssue(errors, "tier", "Tier must be read or do.");
+  }
+
+  if (node.role === "decor" && Array.isArray(node.files) && node.files.length > 0) {
+    pushIssue(warnings, "files", "Decor nodes usually should not carry attached files.");
+  }
+
+  if (node.role === "workstation" && node.power == null) {
+    pushIssue(warnings, "power", "Workstations are clearer when they advertise a power binding.");
+  }
+
+  if (node.tier === "do" && node.power == null && node.ai == null) {
+    pushIssue(
+      warnings,
+      "tier",
+      "Do-tier nodes are easier to reason about when they also bind power or AI.",
+    );
+  }
+
+  return {
+    errors,
+    warnings,
+    isValid: errors.length === 0,
+  };
+}
+
+function syncFocusState(state, node) {
+  assertPlainObject(state, "state");
+  assertPlainObject(node, "node");
+
+  return {
+    focusedField: normalizeFocusTarget(state.focusedField),
+    validation: validateNodeRecord(node),
+  };
+}
+
+function getFocusedSection(stateOrTarget) {
+  if (typeof stateOrTarget === "string") {
+    return getFocusSection(stateOrTarget);
+  }
+
+  assertPlainObject(stateOrTarget, "state");
+  return getFocusSection(stateOrTarget.focusedField);
+}
+
+const NODE_SHEET_SECTIONS = FIELD_SECTIONS;
+const NODE_SHEET_ACTION_TARGETS = ACTION_TARGETS;
+const NODE_SHEET_FOCUS_ORDER = FOCUS_ORDER;
+
+const ACTION_IDS = Object.freeze(["open", "attach", "download", "markDone"]);
+const RESULT_KIND_BY_ACTION = Object.freeze({
+  open: new Set(["open", "openDocument"]),
+  attach: new Set(["attach", "attachFile"]),
+  download: new Set(["download", "downloadAttachedFile"]),
+  markDone: new Set(["markDone", "mark-done"]),
+});
+
+function assertPlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+}
+
+function assertActionId(actionId) {
+  if (!ACTION_IDS.includes(actionId)) {
+    throw new RangeError(`actionId must be one of ${ACTION_IDS.join(", ")}.`);
+  }
+}
+
+function countFiles(node) {
+  return Array.isArray(node.files) ? node.files.length : 0;
+}
+
+function fileCountLabel(count) {
+  return `${count} file${count === 1 ? "" : "s"} ready`;
+}
+
+function isDoTier(node) {
+  return node.tier === "do";
+}
+
+function isDecor(node) {
+  return node.role === "decor";
+}
+
+function actionMatchesResult(actionId, lastResult) {
+  return Boolean(lastResult && RESULT_KIND_BY_ACTION[actionId]?.has(lastResult.kind));
+}
+
+function createBaseAffordance(node, actionId) {
+  switch (actionId) {
+    case "open":
+      return {
+        id: "open",
+        label: "Open",
+        enabled: true,
+        tone: "secondary",
+        requiresConfirm: false,
+        status: "Ready",
+        hint: "View this node and its local details.",
+      };
+    case "attach":
+      if (isDecor(node)) {
+        return {
+          id: "attach",
+          label: "Attach",
+          enabled: false,
+          tone: "disabled",
+          requiresConfirm: false,
+          status: "Unavailable",
+          hint: "Decor cannot hold files.",
+        };
+      }
+
+      if (isDoTier(node)) {
+        return {
+          id: "attach",
+          label: "Attach",
+          enabled: true,
+          tone: "needs-confirm",
+          requiresConfirm: true,
+          status: "Needs confirm",
+          hint: "Add a local or mock file after confirmation.",
+        };
+      }
+
+      return {
+        id: "attach",
+        label: "Attach",
+        enabled: true,
+        tone: "secondary",
+        requiresConfirm: false,
+        status: "Ready",
+        hint: "Add a local or mock file.",
+      };
+    case "download": {
+      const files = countFiles(node);
+      return {
+        id: "download",
+        label: "Download",
+        enabled: files > 0,
+        tone: files > 0 ? "secondary" : "disabled",
+        requiresConfirm: false,
+        status: files > 0 ? fileCountLabel(files) : "No files",
+        hint: files > 0 ? "Download attached file data." : "Attach a file first.",
+      };
+    }
+    case "markDone":
+      if (isDoTier(node)) {
+        return {
+          id: "markDone",
+          label: "Mark done",
+          enabled: true,
+          tone: "needs-confirm",
+          requiresConfirm: true,
+          status: "Needs confirm",
+          hint: "Confirm before marking this node done.",
+        };
+      }
+
+      return {
+        id: "markDone",
+        label: "Mark done",
+        enabled: true,
+        tone: "primary",
+        requiresConfirm: false,
+        status: "Ready",
+        hint: "Mark this node done in the village.",
+      };
+    default:
+      return {
+        id: actionId,
+        label: actionId,
+        enabled: false,
+        tone: "disabled",
+        requiresConfirm: false,
+        status: "Unavailable",
+        hint: "This action is not available.",
+      };
+  }
+}
+
+function applyResultCopy(affordance, lastResult) {
+  if (!actionMatchesResult(affordance.id, lastResult)) {
+    return affordance;
+  }
+
+  if (lastResult.gate === "denied") {
+    return {
+      ...affordance,
+      tone: "disabled",
+      status: "Blocked",
+      hint: "The boundary policy blocked this action.",
+    };
+  }
+
+  if (lastResult.gate === "needs-confirm") {
+    return {
+      ...affordance,
+      tone: "needs-confirm",
+      requiresConfirm: true,
+      status: "Needs confirm",
+      hint: "Confirm this action before it changes the node.",
+    };
+  }
+
+  if (lastResult.gate !== "allowed") {
+    return affordance;
+  }
+
+  switch (affordance.id) {
+    case "open":
+      return {
+        ...affordance,
+        status: "Opened",
+        hint: "The document view opened for this node.",
+      };
+    case "attach":
+      return {
+        ...affordance,
+        status: "Attached",
+        hint: lastResult.file?.name
+          ? `Added ${lastResult.file.name}.`
+          : "Added a file to this node.",
+      };
+    case "download":
+      return {
+        ...affordance,
+        status: "Downloaded",
+        hint: "Prepared attached file data for download.",
+      };
+    case "markDone":
+      return {
+        ...affordance,
+        status: lastResult.done ? "Marked done" : affordance.status,
+        hint: lastResult.done
+          ? "Completion was recorded for this node."
+          : affordance.hint,
+      };
+    default:
+      return affordance;
+  }
+}
+
+function buildActionAffordance(node, actionId, options = {}) {
+  assertPlainObject(node, "node");
+  assertActionId(actionId);
+  assertPlainObject(options, "options");
+
+  const affordance = createBaseAffordance(node, actionId);
+  return applyResultCopy(affordance, options.lastResult ?? null);
+}
+
+function buildActionAffordances(node, options = {}) {
+  assertPlainObject(node, "node");
+  assertPlainObject(options, "options");
+
+  return ACTION_IDS.map((actionId) => buildActionAffordance(node, actionId, options));
+}
+
+const NODE_SHEET_ACTION_IDS = ACTION_IDS;
+
+
+
+const UI_LABELS = Object.freeze({
+  name: "Name",
+  notes: "Notes",
+  links: "Links",
+  files: "Files",
+  power: "Power",
+  ai: "AI",
+  actions: "Actions",
+  tier: "Tier",
+});
+
+function assertPlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+}
+
+function cloneIssue(issue) {
+  return {
+    field: issue.field,
+    message: issue.message,
+  };
+}
+
+function summarizeField(node, field) {
+  switch (field) {
+    case "name":
+      return node.name.trim() || "Untitled node";
+    case "notes":
+      return node.notes.trim() ? `${node.notes.trim().length} chars` : "No notes";
+    case "links":
+      return `${node.links.length} link${node.links.length === 1 ? "" : "s"}`;
+    case "files":
+      return `${node.files.length} file${node.files.length === 1 ? "" : "s"}`;
+    case "power":
+      return node.power ? node.power.category : "Unbound";
+    case "ai":
+      return node.ai ? node.ai.persona || node.ai.agentId : "No agent";
+    case "actions":
+      return node.tier === "do" ? "Needs confirm" : "Read-only";
+    case "tier":
+      return node.tier;
+    default:
+      return "";
+  }
+}
+
+function syncUiState(state, node) {
+  return syncFocusState(state, node);
+}
+
+function buildUiModel(node, state, options = {}) {
+  assertPlainObject(node, "node");
+  assertPlainObject(state, "state");
+  assertPlainObject(options, "options");
+
+  const dirty = Boolean(options.dirty);
+  const uiState = syncUiState(state, node);
+  const focusedSection = getFocusedSection(uiState);
+  const invalidFields = new Set(uiState.validation.errors.map((issue) => issue.field));
+  const warningFields = new Set(uiState.validation.warnings.map((issue) => issue.field));
+
+  return {
+    focusedField: uiState.focusedField,
+    fields: NODE_SHEET_SECTIONS.map((field) => ({
+      field,
+      label: UI_LABELS[field],
+      focused: focusedSection === field,
+      invalid: invalidFields.has(field),
+      warning: warningFields.has(field),
+      summary: summarizeField(node, field),
+      dirty,
+    })),
+    validation: {
+      errors: uiState.validation.errors.map(cloneIssue),
+      warnings: uiState.validation.warnings.map(cloneIssue),
+      isValid: uiState.validation.isValid,
+    },
+  };
+}
+
+const createUiState = createFocusState;
+
+const NODE_SHEET_UI_FIELDS = NODE_SHEET_SECTIONS;
+
+
+
+
+const KIND_ICONS = Object.freeze({
+  building: "node-building",
+  furniture: "node-furniture",
+  file: "node-file",
+});
+
+const FIELD_ICONS = Object.freeze({
+  name: "field-name",
+  notes: "field-notes",
+  links: "field-links",
+  files: "field-files",
+  power: "field-power",
+  ai: "field-ai",
+  actions: "field-actions",
+  tier: "field-tier",
+});
+
+const ACTION_ICONS = Object.freeze({
+  open: "action-open",
+  attach: "action-attach",
+  download: "action-download",
+  markDone: "action-mark-done",
+});
+
+const DEFAULT_LAYOUT = Object.freeze({
+  x: 24,
+  y: 24,
+  width: 352,
+  padding: 12,
+  headerHeight: 32,
+  rowHeight: 24,
+  rowGap: 4,
+  rowIconSize: 12,
+  buttonHeight: 28,
+  buttonGap: 8,
+  buttonIconSize: 12,
+  footerHeight: 52,
+  titleIconSize: 16,
+  statusIconSize: 12,
+  messageHeight: 18,
+  maxMessages: 3,
+});
+
+function assertPlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+}
+
+function cloneIssue(issue) {
+  return {
+    field: issue.field,
+    message: issue.message,
+  };
+}
+
+function cloneValidation(validation) {
+  return {
+    errors: Array.isArray(validation?.errors) ? validation.errors.map(cloneIssue) : [],
+    warnings: Array.isArray(validation?.warnings) ? validation.warnings.map(cloneIssue) : [],
+    isValid: Boolean(validation?.isValid),
+  };
+}
+
+function clampPositiveNumber(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function mergeLayout(layout = {}) {
+  assertPlainObject(layout, "layout");
+
+  return {
+    x: Number.isFinite(layout.x) ? layout.x : DEFAULT_LAYOUT.x,
+    y: Number.isFinite(layout.y) ? layout.y : DEFAULT_LAYOUT.y,
+    width: clampPositiveNumber(layout.width, DEFAULT_LAYOUT.width),
+    padding: clampPositiveNumber(layout.padding, DEFAULT_LAYOUT.padding),
+    headerHeight: clampPositiveNumber(layout.headerHeight, DEFAULT_LAYOUT.headerHeight),
+    rowHeight: clampPositiveNumber(layout.rowHeight, DEFAULT_LAYOUT.rowHeight),
+    rowGap: clampPositiveNumber(layout.rowGap, DEFAULT_LAYOUT.rowGap),
+    rowIconSize: clampPositiveNumber(layout.rowIconSize, DEFAULT_LAYOUT.rowIconSize),
+    buttonHeight: clampPositiveNumber(layout.buttonHeight, DEFAULT_LAYOUT.buttonHeight),
+    buttonGap: clampPositiveNumber(layout.buttonGap, DEFAULT_LAYOUT.buttonGap),
+    buttonIconSize: clampPositiveNumber(layout.buttonIconSize, DEFAULT_LAYOUT.buttonIconSize),
+    footerHeight: clampPositiveNumber(layout.footerHeight, DEFAULT_LAYOUT.footerHeight),
+    titleIconSize: clampPositiveNumber(layout.titleIconSize, DEFAULT_LAYOUT.titleIconSize),
+    statusIconSize: clampPositiveNumber(layout.statusIconSize, DEFAULT_LAYOUT.statusIconSize),
+    messageHeight: clampPositiveNumber(layout.messageHeight, DEFAULT_LAYOUT.messageHeight),
+    maxMessages: clampPositiveNumber(layout.maxMessages, DEFAULT_LAYOUT.maxMessages),
+  };
+}
+
+function createMessageRows(validation, layout, panelX, panelY, panelWidth, panelHeight) {
+  const issues = [...validation.errors, ...validation.warnings].slice(0, layout.maxMessages);
+  const top = panelY + panelHeight - layout.padding - issues.length * layout.messageHeight;
+
+  return issues.map((issue, index) => ({
+    kind: validation.errors.includes(issue) ? "error" : "warning",
+    field: issue.field,
+    message: issue.message,
+    x: panelX + layout.padding,
+    y: top + index * layout.messageHeight,
+    width: panelWidth - layout.padding * 2,
+    height: layout.messageHeight,
+  }));
+}
+
+function resolveTitle(node) {
+  const name = typeof node.name === "string" ? node.name.trim() : "";
+  return name || node.id;
+}
+
+function resolveStatusTone(row) {
+  if (row.invalid) return "error";
+  if (row.warning) return "warning";
+  if (row.focused) return "focus";
+  return "normal";
+}
+
+function resolveRowIcon(row, node) {
+  if (row.field === "power" && node.power?.category) {
+    return `power-${node.power.category}`;
+  }
+
+  if (row.field === "actions") {
+    return node.tier === "do" ? "tier-do" : "tier-read";
+  }
+
+  return FIELD_ICONS[row.field] ?? "field-generic";
+}
+
+function countMessageRows(validation, maxMessages) {
+  return Math.min(
+    maxMessages,
+    (validation.errors?.length ?? 0) + (validation.warnings?.length ?? 0),
+  );
+}
+
+function buildRenderModel(sheetState, focusState = createUiState(), options = {}) {
+  assertPlainObject(sheetState, "sheetState");
+  assertPlainObject(sheetState.node, "sheetState.node");
+  assertPlainObject(focusState, "focusState");
+  assertPlainObject(options, "options");
+
+  const layout = mergeLayout(options.layout ?? {});
+  const dirty = "dirty" in options ? Boolean(options.dirty) : Boolean(sheetState.dirty);
+  const syncedFocus = syncUiState(focusState, sheetState.node);
+  const uiModel = buildUiModel(sheetState.node, syncedFocus, { dirty });
+  const validation = cloneValidation(uiModel.validation);
+  const rowCount = uiModel.fields.length;
+  const messageCount = countMessageRows(validation, layout.maxMessages);
+  const panelHeight =
+    layout.headerHeight +
+    layout.padding * 2 +
+    rowCount * layout.rowHeight +
+    Math.max(0, rowCount - 1) * layout.rowGap +
+    layout.footerHeight +
+    messageCount * layout.messageHeight;
+  const panel = {
+    x: layout.x,
+    y: layout.y,
+    width: layout.width,
+    height: panelHeight,
+  };
+  const contentX = panel.x + layout.padding;
+  const contentWidth = panel.width - layout.padding * 2;
+  const rowStartY = panel.y + layout.padding + layout.headerHeight;
+  const rowLabelWidth = Math.min(76, Math.floor(contentWidth * 0.28));
+  const rowIconGap = 8;
+  const rowTextX = contentX + layout.rowIconSize + rowIconGap;
+  const rowSummaryWidth = contentWidth - (rowTextX - contentX) - rowLabelWidth - rowIconGap;
+  const footerY = rowStartY + rowCount * layout.rowHeight + Math.max(0, rowCount - 1) * layout.rowGap + 12;
+  const actionAffordances = buildActionAffordances(sheetState.node, {
+    lastResult: options.lastResult ?? null,
+  });
+  const buttonWidth = Math.floor(
+    (contentWidth - layout.buttonGap * (NODE_SHEET_ACTION_IDS.length - 1)) /
+      NODE_SHEET_ACTION_IDS.length,
+  );
+
+  const rows = uiModel.fields.map((row, index) => {
+    const y = rowStartY + index * (layout.rowHeight + layout.rowGap);
+
+    return {
+      field: row.field,
+      label: row.label,
+      summary: row.summary,
+      focused: row.focused,
+      invalid: row.invalid,
+      warning: row.warning,
+      dirty: row.dirty,
+      tone: resolveStatusTone(row),
+      icon: resolveRowIcon(row, sheetState.node),
+      x: contentX,
+      y,
+      width: contentWidth,
+      height: layout.rowHeight,
+      iconBox: {
+        x: contentX,
+        y: y + Math.floor((layout.rowHeight - layout.rowIconSize) / 2),
+        size: layout.rowIconSize,
+      },
+      labelBox: {
+        x: rowTextX,
+        y,
+        width: rowLabelWidth,
+        height: layout.rowHeight,
+      },
+      summaryBox: {
+        x: rowTextX + rowLabelWidth + rowIconGap,
+        y,
+        width: rowSummaryWidth,
+        height: layout.rowHeight,
+      },
+    };
+  });
+
+  const actions = actionAffordances.map((action, index) => {
+    const x = contentX + index * (buttonWidth + layout.buttonGap);
+
+    return {
+      id: action.id,
+      label: action.label,
+      icon: ACTION_ICONS[action.id] ?? "action-generic",
+      enabled: action.enabled,
+      focused: uiModel.focusedField === `action:${action.id}`,
+      tone: action.tone,
+      status: action.status,
+      hint: action.hint,
+      requiresConfirm: action.requiresConfirm,
+      x,
+      y: footerY,
+      width: buttonWidth,
+      height: layout.buttonHeight,
+      iconBox: {
+        x: x + 8,
+        y: footerY + Math.floor((layout.buttonHeight - layout.buttonIconSize) / 2),
+        size: layout.buttonIconSize,
+      },
+      labelBox: {
+        x: x + 24,
+        y: footerY,
+        width: Math.max(0, buttonWidth - 32),
+        height: layout.buttonHeight,
+      },
+    };
+  });
+
+  const messageRows = createMessageRows(validation, layout, panel.x, panel.y, panel.width, panel.height);
+  const icons = [
+    {
+      name: KIND_ICONS[sheetState.node.kind] ?? "node-generic",
+      x: contentX,
+      y: panel.y + layout.padding + Math.floor((layout.headerHeight - layout.titleIconSize) / 2),
+      size: layout.titleIconSize,
+      tone: "title",
+    },
+    {
+      name: `mood-${sheetState.node.mood}`,
+      x: panel.x + panel.width - layout.padding - layout.statusIconSize,
+      y: panel.y + layout.padding + Math.floor((layout.headerHeight - layout.statusIconSize) / 2),
+      size: layout.statusIconSize,
+      tone: sheetState.node.mood,
+    },
+    ...rows.map((row) => ({
+      name: row.icon,
+      x: row.iconBox.x,
+      y: row.iconBox.y,
+      size: row.iconBox.size,
+      tone: row.tone,
+    })),
+    ...actions.map((action) => ({
+      name: action.icon,
+      x: action.iconBox.x,
+      y: action.iconBox.y,
+      size: action.iconBox.size,
+      tone: action.tone,
+    })),
+  ];
+
+  return {
+    visible: true,
+    title: resolveTitle(sheetState.node),
+    subtitle: `${sheetState.node.kind} · ${sheetState.node.role ?? "none"}`,
+    kind: sheetState.node.kind,
+    role: sheetState.node.role,
+    files: Array.isArray(sheetState.node.files) ? sheetState.node.files.length : 0,
+    links: Array.isArray(sheetState.node.links) ? sheetState.node.links.length : 0,
+    dirty,
+    tier: sheetState.node.tier,
+    mood: sheetState.node.mood,
+    focusedField: uiModel.focusedField,
+    sections: rows,
+    rows,
+    actions,
+    buttons: actions,
+    icons,
+    validation,
+    messages: messageRows,
+    panel,
+  };
+}
+
+const NODE_SHEET_RENDER_LAYOUT = DEFAULT_LAYOUT;
+
+return {buildRenderModel,createUiState,focusField,focusNextField,focusPreviousField,syncUiState};})();
+const FILES_IDENTITY=(()=>{
+function assertArray(value, label) {
+  if (!Array.isArray(value)) {
+    throw new TypeError(`${label} must be an array.`);
+  }
+}
+
+function assertPlainObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be a plain object.`);
+  }
+}
+
+function assertNonEmptyString(value, label) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new TypeError(`${label} must be a non-empty string.`);
+  }
+}
+
+function maybeString(value) {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : null;
+}
+
+function slugify(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "") || "item";
+}
+
+function formatIdentityPart(value, fallback) {
+  return Number.isFinite(value) ? String(Math.trunc(value)) : String(fallback);
+}
+
+function resolveLabel(value, fallback) {
+  return (
+    maybeString(value?.displayName) ||
+    maybeString(value?.name) ||
+    maybeString(value?.objName) ||
+    maybeString(value?.img) ||
+    fallback
+  );
+}
+
+function cloneBinding(binding) {
+  return {
+    ...binding,
+    objectMeta: binding.objectMeta ? { ...binding.objectMeta } : null,
+  };
+}
+
+function createApprovedFurnitureIndex(approvedFurniture = []) {
+  assertArray(approvedFurniture, "approvedFurniture");
+  const index = new Map();
+
+  for (const entry of approvedFurniture) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+
+    const entryId = maybeString(entry.id);
+    if (entryId && !index.has(entryId)) {
+      index.set(entryId, entry);
+    }
+
+    if (!Array.isArray(entry.frames)) {
+      continue;
+    }
+
+    for (const frame of entry.frames) {
+      const frameId = maybeString(frame?.img);
+      if (frameId && !index.has(frameId)) {
+        index.set(frameId, entry);
+      }
+    }
+  }
+
+  return index;
+}
+
+function resolveApprovedFurnitureMeta(furniture, approvedIndex) {
+  const explicitId = maybeString(furniture?.id);
+  if (explicitId && approvedIndex.has(explicitId)) {
+    return approvedIndex.get(explicitId);
+  }
+
+  const frameId = maybeString(furniture?.img);
+  if (frameId && approvedIndex.has(frameId)) {
+    return approvedIndex.get(frameId);
+  }
+
+  return null;
+}
+
+function isContainerFurniture(objectMeta) {
+  if (!objectMeta || typeof objectMeta !== "object") {
+    return false;
+  }
+
+  return objectMeta.role === "container" || objectMeta.containerKind === "folder";
+}
+
+function resolveBuildingContainerId(building, index = 0) {
+  assertPlainObject(building, "building");
+
+  const explicitId = maybeString(building.id);
+  if (explicitId) {
+    return explicitId;
+  }
+
+  const fallbackIndex = Number.isInteger(index) && index >= 0 ? index + 1 : 1;
+  const base = slugify(
+    building.objName || building.name || building.img || `building_${fallbackIndex}`,
+  );
+
+  return [
+    "bld",
+    base,
+    formatIdentityPart(building.tx, `x${fallbackIndex}`),
+    formatIdentityPart(building.ty, `y${fallbackIndex}`),
+    formatIdentityPart(building.rot, 0),
+  ].join("_");
+}
+
+function resolveFurnitureContainerId({
+  buildingId,
+  furniture,
+  furnitureIndex = 0,
+  approvedMeta = null,
+} = {}) {
+  assertNonEmptyString(buildingId, "buildingId");
+  assertPlainObject(furniture, "furniture");
+
+  const explicitId = maybeString(furniture.id);
+  if (explicitId && /^furn_/i.test(explicitId)) {
+    return explicitId;
+  }
+
+  const fallbackIndex = Number.isInteger(furnitureIndex) && furnitureIndex >= 0
+    ? furnitureIndex + 1
+    : 1;
+  const sourceId =
+    maybeString(approvedMeta?.id) ||
+    explicitId ||
+    maybeString(furniture.img) ||
+    maybeString(furniture.objName) ||
+    maybeString(furniture.name) ||
+    `furniture_${fallbackIndex}`;
+
+  return [
+    "furn",
+    slugify(buildingId),
+    slugify(sourceId),
+    formatIdentityPart(furniture.tx, `x${fallbackIndex}`),
+    formatIdentityPart(furniture.ty, `y${fallbackIndex}`),
+    formatIdentityPart(furniture.rot, 0),
+  ].join("_");
+}
+
+function deriveContainerIdentityBindings({
+  buildings = [],
+  approvedFurniture = [],
+} = {}) {
+  assertArray(buildings, "buildings");
+  const approvedIndex = createApprovedFurnitureIndex(approvedFurniture);
+  const bindings = [];
+
+  buildings.forEach((building, buildingIndex) => {
+    if (!building || typeof building !== "object") {
+      return;
+    }
+
+    const buildingId = resolveBuildingContainerId(building, buildingIndex);
+    bindings.push({
+      containerId: buildingId,
+      nodeId: buildingId,
+      kind: "building",
+      buildingId,
+      objectId:
+        maybeString(building.id) ||
+        maybeString(building.objName) ||
+        maybeString(building.img) ||
+        null,
+      label: resolveLabel(building, `Building ${buildingIndex + 1}`),
+      building,
+      furniture: null,
+      objectMeta: null,
+    });
+
+    const roomFurniture = Array.isArray(building.room?.furniture)
+      ? building.room.furniture
+      : [];
+
+    roomFurniture.forEach((furniture, furnitureIndex) => {
+      if (!furniture || typeof furniture !== "object") {
+        return;
+      }
+
+      const objectMeta = resolveApprovedFurnitureMeta(furniture, approvedIndex);
+      if (!isContainerFurniture(objectMeta)) {
+        return;
+      }
+
+      const containerId = resolveFurnitureContainerId({
+        buildingId,
+        furniture,
+        furnitureIndex,
+        approvedMeta: objectMeta,
+      });
+
+      bindings.push({
+        containerId,
+        nodeId: containerId,
+        kind: "furniture",
+        buildingId,
+        objectId:
+          maybeString(objectMeta?.id) ||
+          maybeString(furniture.id) ||
+          maybeString(furniture.img) ||
+          null,
+        label: resolveLabel(objectMeta || furniture, `Furniture ${furnitureIndex + 1}`),
+        building,
+        furniture,
+        objectMeta: objectMeta ? { ...objectMeta } : null,
+      });
+    });
+  });
+
+  return bindings;
+}
+
+function createContainerIdentityMap(input = {}) {
+  const { buildings = [], approvedFurniture = [] } = input;
+  const bindings = deriveContainerIdentityBindings({
+    buildings,
+    approvedFurniture,
+  });
+  const approvedIndex = createApprovedFurnitureIndex(approvedFurniture);
+  const byContainerId = new Map(bindings.map((binding) => [binding.containerId, binding]));
+
+  return {
+    listBindings() {
+      return bindings.map(cloneBinding);
+    },
+    getBinding(containerId) {
+      assertNonEmptyString(containerId, "containerId");
+      const binding = byContainerId.get(containerId);
+      return binding ? cloneBinding(binding) : null;
+    },
+    getBuildingContainerId(building, index = 0) {
+      return resolveBuildingContainerId(building, index);
+    },
+    getFurnitureContainerId({ buildingId, furniture, furnitureIndex = 0 } = {}) {
+      const approvedMeta = resolveApprovedFurnitureMeta(furniture, approvedIndex);
+      return resolveFurnitureContainerId({
+        buildingId,
+        furniture,
+        furnitureIndex,
+        approvedMeta,
+      });
+    },
+  };
+}
+
+return {resolveBuildingContainerId,resolveFurnitureContainerId,deriveContainerIdentityBindings,createContainerIdentityMap};})();
 const FILES_MOUNT=(()=>{
-const {MockFileProvider,createContainerRef,createFileRef,createFileWorkspace}=FILES;
+const {MockFileProvider,createContainerRef,createFileRef,createFileWorkspace}=FILES;const {createContainerIdentityMap,resolveBuildingContainerId,resolveFurnitureContainerId,deriveContainerIdentityBindings}=FILES_IDENTITY;
+
 
 
 const OPEN_CONTAINER_KEYS = new Set(["f"]);
@@ -3492,7 +5529,10 @@ function cloneContainer(container) {
 }
 
 function cloneBindings(bindings) {
-  return bindings.map((binding) => ({ ...binding }));
+  return bindings.map((binding) => ({
+    ...binding,
+    objectMeta: binding.objectMeta ? { ...binding.objectMeta } : null,
+  }));
 }
 
 function cloneDocument(document) {
@@ -3504,79 +5544,6 @@ function cloneDocument(document) {
     file: cloneFile(document.file),
     text: document.text,
   };
-}
-
-function createObjectIndex(objects) {
-  const index = new Map();
-
-  for (const object of objects) {
-    if (!object || typeof object !== "object") {
-      continue;
-    }
-
-    const objectId = maybeString(object.id);
-    if (objectId && !index.has(objectId)) {
-      index.set(objectId, object);
-    }
-
-    if (!Array.isArray(object.frames)) {
-      continue;
-    }
-
-    for (const frame of object.frames) {
-      const frameId = maybeString(frame?.img);
-      if (frameId && !index.has(frameId)) {
-        index.set(frameId, object);
-      }
-    }
-  }
-
-  return index;
-}
-
-function resolveBuildingId(building, index) {
-  return (
-    maybeString(building.id) ||
-    `bld_${slugify(
-      building.objName || building.name || building.img || `building_${index + 1}`,
-    )}_${index + 1}_${building.tx ?? 0}_${building.ty ?? 0}`
-  );
-}
-
-function resolveFurnitureId(buildingId, furniture, index) {
-  return (
-    maybeString(furniture.id) ||
-    `furn_${slugify(buildingId)}_${slugify(
-      furniture.img || furniture.objName || furniture.name || `furniture_${index + 1}`,
-    )}_${index + 1}_${furniture.tx ?? 0}_${furniture.ty ?? 0}`
-  );
-}
-
-function resolveBuildingLabel(building, index) {
-  return (
-    maybeString(building.name) ||
-    maybeString(building.objName) ||
-    maybeString(building.img) ||
-    `Building ${index + 1}`
-  );
-}
-
-function resolveFurnitureLabel(furniture, objectMeta, index) {
-  return (
-    maybeString(objectMeta?.displayName) ||
-    maybeString(furniture.name) ||
-    maybeString(furniture.objName) ||
-    maybeString(furniture.img) ||
-    `Furniture ${index + 1}`
-  );
-}
-
-function isContainerFurniture(objectMeta) {
-  if (!objectMeta || typeof objectMeta !== "object") {
-    return false;
-  }
-
-  return objectMeta.role === "container" || objectMeta.containerKind === "folder";
 }
 
 function createMockFile(containerId, name, text, suffix) {
@@ -3622,71 +5589,57 @@ function buildFurnitureDocument(buildingLabel, furnitureLabel, objectMeta) {
 }
 
 function deriveMountFixtures({ buildings = [], objects = [] } = {}) {
-  const objectIndex = createObjectIndex(objects);
+  const identities = createContainerIdentityMap({
+    buildings,
+    approvedFurniture: objects,
+  });
+  const bindings = identities.listBindings();
   const containers = [];
   const documents = {};
-  const bindings = [];
 
-  buildings.forEach((building, buildingIndex) => {
-    const buildingId = resolveBuildingId(building, buildingIndex);
-    const buildingLabel = resolveBuildingLabel(building, buildingIndex);
-    const roomFurniture = Array.isArray(building.room?.furniture)
-      ? building.room.furniture
-      : [];
-    const buildingFile = createMockFile(
-      buildingId,
-      `${slugify(buildingLabel)}-overview.md`,
-      buildBuildingDocument(building, buildingLabel, roomFurniture.length),
-      "overview",
-    );
-
-    containers.push(
-      createContainerRef({
-        id: buildingId,
-        kind: "building",
-        files: [buildingFile.ref],
-      }),
-    );
-    documents[buildingFile.ref.id] = buildingFile.text;
-    bindings.push({
-      containerId: buildingId,
-      nodeId: buildingId,
-      kind: "building",
-      buildingId,
-      label: buildingLabel,
-    });
-
-    roomFurniture.forEach((furniture, furnitureIndex) => {
-      const objectMeta = objectIndex.get(furniture.img) || objectIndex.get(furniture.id);
-      if (!isContainerFurniture(objectMeta)) {
-        return;
-      }
-
-      const furnitureId = resolveFurnitureId(buildingId, furniture, furnitureIndex);
-      const furnitureLabel = resolveFurnitureLabel(furniture, objectMeta, furnitureIndex);
-      const furnitureFile = createMockFile(
-        furnitureId,
-        `${slugify(furnitureLabel)}-inventory.md`,
-        buildFurnitureDocument(buildingLabel, furnitureLabel, objectMeta),
-        "inventory",
+  bindings.forEach((binding) => {
+    if (binding.kind === "building") {
+      const roomFurniture = Array.isArray(binding.building?.room?.furniture)
+        ? binding.building.room.furniture
+        : [];
+      const buildingFile = createMockFile(
+        binding.containerId,
+        `${slugify(binding.label)}-overview.md`,
+        buildBuildingDocument(binding.building, binding.label, roomFurniture.length),
+        "overview",
       );
 
       containers.push(
         createContainerRef({
-          id: furnitureId,
-          kind: "folder",
-          files: [furnitureFile.ref],
+          id: binding.containerId,
+          kind: "building",
+          files: [buildingFile.ref],
         }),
       );
-      documents[furnitureFile.ref.id] = furnitureFile.text;
-      bindings.push({
-        containerId: furnitureId,
-        nodeId: furnitureId,
-        kind: "furniture",
-        buildingId,
-        label: furnitureLabel,
-      });
-    });
+      documents[buildingFile.ref.id] = buildingFile.text;
+      return;
+    }
+
+    const buildingLabel =
+      maybeString(binding.building?.name) ||
+      maybeString(binding.building?.objName) ||
+      maybeString(binding.building?.img) ||
+      "Building";
+    const furnitureFile = createMockFile(
+      binding.containerId,
+      `${slugify(binding.label)}-inventory.md`,
+      buildFurnitureDocument(buildingLabel, binding.label, binding.objectMeta),
+      "inventory",
+    );
+
+    containers.push(
+      createContainerRef({
+        id: binding.containerId,
+        kind: "folder",
+        files: [furnitureFile.ref],
+      }),
+    );
+    documents[furnitureFile.ref.id] = furnitureFile.text;
   });
 
   return {
@@ -3733,10 +5686,9 @@ function findDefaultContainerId(ctx, bindings) {
     const currentBuilding = ctx.town.getCurrentBuilding();
     if (currentBuilding) {
       const buildingIndex = Math.max(0, buildings.indexOf(currentBuilding));
-      const buildingId = resolveBuildingId(currentBuilding, buildingIndex);
+      const buildingId = resolveBuildingContainerId(currentBuilding, buildingIndex);
       const furnitureBinding = bindings.find(
-        (binding) =>
-          binding.kind === "furniture" && binding.buildingId === buildingId,
+        (binding) => binding.kind === "furniture" && binding.buildingId === buildingId,
       );
 
       return furnitureBinding?.containerId || buildingId;
@@ -3747,7 +5699,7 @@ function findDefaultContainerId(ctx, bindings) {
     const nearestBuilding = ctx.town.nearestBuilding();
     if (nearestBuilding) {
       const buildingIndex = Math.max(0, buildings.indexOf(nearestBuilding));
-      return resolveBuildingId(nearestBuilding, buildingIndex);
+      return resolveBuildingContainerId(nearestBuilding, buildingIndex);
     }
   }
 
@@ -3880,7 +5832,9 @@ function mount(ctx) {
 
 return {mount};})();
 const NODESHEET_MOUNT=(()=>{
-const {attachFile,closeSheet,linkFile,linkUrl,markNodeDone,openSheet,setField,syncFiles}=NODESHEET;
+const {attachFile,closeSheet,linkFile,linkUrl,markNodeDone,openSheet,setField,syncFiles}=NODESHEET;const {buildRenderModel:buildSheetRenderModel,createUiState,focusField,focusNextField,focusPreviousField,syncUiState:syncPolishState}=NODESHEET_UI;
+
+
 
 
 const OPEN_SHEET_KEYS = new Set(["n"]);
@@ -3993,6 +5947,21 @@ function cloneLastResult(result) {
     done: result.done ?? null,
     file: result.file ? cloneFile(result.file) : null,
     link: result.link ? cloneLink(result.link) : null,
+  };
+}
+
+function cloneValidation(validation) {
+  return {
+    errors: validation.errors.map((issue) => ({ field: issue.field, message: issue.message })),
+    warnings: validation.warnings.map((issue) => ({ field: issue.field, message: issue.message })),
+    isValid: Boolean(validation.isValid),
+  };
+}
+
+function cloneUiState(uiState) {
+  return {
+    focusedField: uiState.focusedField,
+    validation: cloneValidation(uiState.validation),
   };
 }
 
@@ -4159,11 +6128,13 @@ function createMountState(bindings) {
     bindingIndex: new Map(bindings.map((binding) => [binding.nodeId, binding])),
     activeNodeId: null,
     sheet: null,
+    ui: createUiState(),
     lastResult: null,
     error: null,
     render: {
       visible: false,
       title: null,
+      subtitle: null,
       kind: null,
       role: null,
       files: 0,
@@ -4172,24 +6143,75 @@ function createMountState(bindings) {
       tier: null,
       mood: null,
       lastGate: null,
+      focusedField: null,
+      sections: [],
+      rows: [],
+      actions: [],
+      buttons: [],
+      icons: [],
+      validation: {
+        errors: [],
+        warnings: [],
+        isValid: true,
+      },
+      messages: [],
+      panel: null,
       error: null,
     },
   };
 }
 
+function refreshUiState(state) {
+  if (!state.sheet) {
+    state.ui = createUiState({ focusedField: state.ui?.focusedField });
+    return state.ui;
+  }
+
+  state.ui = syncPolishState(state.ui, closeSheet(state.sheet));
+  return state.ui;
+}
+
 function buildRenderModel(state) {
-  const node = state.sheet ? closeSheet(state.sheet) : null;
+  const closedSheet = state.sheet
+    ? {
+        node: closeSheet(state.sheet),
+        dirty: state.sheet.dirty,
+      }
+    : null;
+
+  if (!closedSheet) {
+    return {
+      visible: false,
+      title: null,
+      subtitle: null,
+      kind: null,
+      role: null,
+      files: 0,
+      links: 0,
+      dirty: false,
+      tier: null,
+      mood: null,
+      lastGate: state.lastResult?.gate ?? null,
+      focusedField: null,
+      sections: [],
+      rows: [],
+      actions: [],
+      buttons: [],
+      icons: [],
+      validation: cloneValidation(state.ui.validation),
+      messages: [],
+      panel: null,
+      error: state.error,
+    };
+  }
+
+  const render = buildSheetRenderModel(closedSheet, state.ui, {
+    dirty: closedSheet.dirty,
+    lastResult: state.lastResult,
+  });
 
   return {
-    visible: Boolean(node),
-    title: node ? node.name || node.id : null,
-    kind: node?.kind ?? null,
-    role: node?.role ?? null,
-    files: node?.files.length ?? 0,
-    links: node?.links.length ?? 0,
-    dirty: Boolean(state.sheet?.dirty),
-    tier: node?.tier ?? null,
-    mood: node?.mood ?? null,
+    ...render,
     lastGate: state.lastResult?.gate ?? null,
     error: state.error,
   };
@@ -4207,6 +6229,7 @@ function snapshotState(state) {
       : null,
     lastResult: cloneLastResult(state.lastResult),
     error: state.error,
+    ui: cloneUiState(state.ui),
     render: { ...state.render },
   };
 }
@@ -4268,6 +6291,7 @@ function mount(ctx) {
 
     state.activeNodeId = binding.nodeId;
     state.sheet = nextSheet;
+    refreshUiState(state);
     state.lastResult = { kind: "open", gate: "allowed", done: null, file: null, link: null };
     state.error = null;
     state.render = buildRenderModel(state);
@@ -4282,6 +6306,7 @@ function mount(ctx) {
   function closeActiveSheet() {
     state.activeNodeId = null;
     state.sheet = null;
+    refreshUiState(state);
     state.lastResult = { kind: "close", gate: "allowed", done: null, file: null, link: null };
     state.error = null;
     state.render = buildRenderModel(state);
@@ -4313,7 +6338,46 @@ function mount(ctx) {
         }
 
         state.sheet = setField(current, field, event?.value);
+        state.ui = focusField(state.ui, field);
         state.lastResult = { kind: "setField", gate: "allowed", done: null, file: null, link: null };
+        break;
+      }
+      case "focusField": {
+        const field = maybeString(event?.field);
+        if (!field) {
+          throw new Error("focusField requires a field.");
+        }
+
+        state.ui = focusField(state.ui, field);
+        state.lastResult = {
+          kind: "focusField",
+          gate: "allowed",
+          done: null,
+          file: null,
+          link: null,
+        };
+        break;
+      }
+      case "focusNext": {
+        state.ui = focusNextField(state.ui);
+        state.lastResult = {
+          kind: "focusNext",
+          gate: "allowed",
+          done: null,
+          file: null,
+          link: null,
+        };
+        break;
+      }
+      case "focusPrevious": {
+        state.ui = focusPreviousField(state.ui);
+        state.lastResult = {
+          kind: "focusPrevious",
+          gate: "allowed",
+          done: null,
+          file: null,
+          link: null,
+        };
         break;
       }
       case "syncFiles": {
@@ -4378,6 +6442,7 @@ function mount(ctx) {
         return snapshotState(state);
     }
 
+    refreshUiState(state);
     state.error = null;
     state.render = buildRenderModel(state);
     return snapshotState(state);
@@ -4400,6 +6465,15 @@ function mount(ctx) {
       if (OPEN_SHEET_KEYS.has(key)) {
         const nodeId = findDefaultNodeId(ctx, state.bindingIndex);
         return nodeId ? openNodeById(nodeId) : snapshotState(state);
+      }
+
+      if (key === "tab" && state.sheet) {
+        state.ui = event?.shiftKey ? focusPreviousField(state.ui) : focusNextField(state.ui);
+        refreshUiState(state);
+        state.lastResult = { kind: "focus", gate: "allowed", done: null, file: null, link: null };
+        state.error = null;
+        state.render = buildRenderModel(state);
+        return snapshotState(state);
       }
 
       if (CLOSE_KEYS.has(key)) {
@@ -4433,10 +6507,12 @@ function mount(ctx) {
       (offMouseDown || createNoop)();
     },
     draw() {
+      refreshUiState(state);
       state.render = buildRenderModel(state);
       return state.render;
     },
     snapshot() {
+      refreshUiState(state);
       state.render = buildRenderModel(state);
       return snapshotState(state);
     },
@@ -4873,7 +6949,9 @@ function mount(ctx, { allowedDropsByContainer } = {}) {
 
 return {mount};})();
 const TUTORIAL_MOUNT=(()=>{
-const {TUTORIAL_STEPS,advance,createTutorialState,isTutorialComplete}=WORLD;
+const {TUTORIAL_STEPS,advance,createTutorialState,isTutorialComplete,acknowledgeFirstTask,buildColdOpenView,createColdOpenState,dismissFiction,setPlayerName}=WORLD;
+
+
 
 
 const STEP_PROMPTS = Object.freeze({
@@ -4926,6 +7004,14 @@ function cloneTutorial(state) {
   };
 }
 
+function cloneColdOpen(state) {
+  return {
+    playerName: state.playerName,
+    fictionDismissed: state.fictionDismissed,
+    taskAcknowledged: state.taskAcknowledged,
+  };
+}
+
 function clonePosition(position) {
   return {
     x: Number(position?.x ?? 0),
@@ -4944,6 +7030,13 @@ function cloneMovementObservation(observation) {
 
 function cloneHistory(history) {
   return history.map(cloneSignal);
+}
+
+function cloneRecoveryState(recoveryState) {
+  return {
+    failureCounts: { ...recoveryState.failureCounts },
+    lastFailureStep: recoveryState.lastFailureStep,
+  };
 }
 
 function normalizeSignal(signal) {
@@ -4966,9 +7059,11 @@ function createNoop() {
 function snapshotState(state) {
   return {
     tutorial: cloneTutorial(state.tutorial),
+    coldOpen: cloneColdOpen(state.coldOpen),
     complete: isTutorialComplete(state.tutorial),
     lastSignal: cloneSignal(state.lastSignal),
     history: cloneHistory(state.history),
+    recovery: cloneRecoveryState(state.recovery),
     movement: cloneMovementObservation(state.movement),
     lastMode: state.lastMode,
     lastPlayer: clonePosition(state.lastPlayer),
@@ -4977,16 +7072,33 @@ function snapshotState(state) {
 
 function drawState(state) {
   const snapshot = snapshotState(state);
+  const currentHour =
+    typeof state.currentHour === "number" ? state.currentHour : state.clockHour();
+  const overlay = buildTutorialOverlayView({
+    tutorialState: snapshot.tutorial,
+    movementObservation: snapshot.movement,
+    lastSignal: snapshot.lastSignal,
+    recoveryState: snapshot.recovery,
+  });
 
   return {
     visible: true,
     complete: snapshot.complete,
     currentStep: snapshot.tutorial.step,
     done: snapshot.tutorial.done,
-    prompt: STEP_PROMPTS[snapshot.tutorial.step],
-    progress: `${snapshot.tutorial.done.length}/${TUTORIAL_STEPS.length}`,
+    prompt: overlay.prompt ?? STEP_PROMPTS[snapshot.tutorial.step],
+    progress: overlay.progress.label,
     movement: snapshot.movement,
     lastSignal: snapshot.lastSignal,
+    steps: overlay.steps,
+    status: overlay.status,
+    recovery: overlay.recovery,
+    overlay,
+    coldOpen: buildColdOpenView({
+      coldOpenState: snapshot.coldOpen,
+      tutorialState: snapshot.tutorial,
+      currentHour,
+    }),
   };
 }
 
@@ -4997,6 +7109,7 @@ function maybeEmitTutorial(state, signal, ctx) {
 
   state.lastSignal = normalized;
   state.history.push(normalized);
+  state.recovery = recordTutorialAttempt(state.recovery, normalized);
   state.tutorial = after;
 
   if (
@@ -5080,8 +7193,10 @@ function mount(ctx) {
   const initialPlayer = clonePosition(ctx.player.get());
   const state = {
     tutorial: createTutorialState(),
+    coldOpen: createColdOpenState(),
     lastSignal: null,
     history: [],
+    recovery: createTutorialRecoveryState(),
     movement: {
       moved: false,
       enteredInterior: false,
@@ -5089,6 +7204,9 @@ function mount(ctx) {
     },
     lastMode: ctx.town.getMode(),
     lastPlayer: initialPlayer,
+    clockHour() {
+      return typeof ctx.clock?.hour === "function" ? ctx.clock.hour() : 8;
+    },
   };
 
   const emit = (signal) => maybeEmitTutorial(state, signal, ctx);
@@ -5096,6 +7214,21 @@ function mount(ctx) {
   ctx.storage.worldTutorial = {
     emit,
     snapshot: () => snapshotState(state),
+    setPlayerName(name) {
+      state.coldOpen = setPlayerName(state.coldOpen, name);
+      return snapshotState(state);
+    },
+    dismissFiction() {
+      state.coldOpen = dismissFiction(state.coldOpen);
+      return snapshotState(state);
+    },
+    acknowledgeFirstTask() {
+      state.coldOpen = acknowledgeFirstTask(state.coldOpen);
+      return snapshotState(state);
+    },
+    render() {
+      return drawState(state);
+    },
   };
 
   const removeKeyDown = ctx.input.onKeyDown(() => {
